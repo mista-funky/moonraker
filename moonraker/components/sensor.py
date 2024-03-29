@@ -12,6 +12,7 @@ import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from functools import partial
+from ..common import RequestType
 
 # Annotation imports
 from typing import (
@@ -115,7 +116,7 @@ class MQTTSensor(BaseSensor):
         self.mqtt: MQTTClient = self.server.load_component(cfg, "mqtt")
 
         self.state_topic: str = cfg.get("state_topic")
-        self.state_response = cfg.load_template("state_response_template", "{payload}")
+        self.state_response = cfg.gettemplate("state_response_template")
         self.config = replace(self.config, source=self.state_topic)
         self.qos: Optional[int] = cfg.getint("qos", None, minval=0, maxval=2)
 
@@ -180,17 +181,17 @@ class Sensors:
         # Register endpoints
         self.server.register_endpoint(
             "/server/sensors/list",
-            ["GET"],
+            RequestType.GET,
             self._handle_sensor_list_request,
         )
         self.server.register_endpoint(
             "/server/sensors/info",
-            ["GET"],
+            RequestType.GET,
             self._handle_sensor_info_request,
         )
         self.server.register_endpoint(
             "/server/sensors/measurements",
-            ["GET"],
+            RequestType.GET,
             self._handle_sensor_measurements_request,
         )
 

@@ -7,32 +7,25 @@
 from __future__ import annotations
 import asyncio
 import os
-import pathlib
 import logging
-import shutil
-import zipfile
 import time
 import tempfile
-import re
-import json
-from ...utils import source_info
-from ...thirdparty.packagekit import enums as PkEnum
-from . import base_config
+from .common import AppType, get_base_configuration, get_app_type
 from .base_deploy import BaseDeploy
 from .app_deploy import AppDeploy
 from .git_deploy import GitDeploy
 from .zip_deploy import ZipDeploy
+from .system_deploy import PackageDeploy
+from ...common import RequestType
 
 # Annotation imports
 from typing import (
     TYPE_CHECKING,
     TypeVar,
     Any,
-    Awaitable,
     Callable,
     Optional,
     Set,
-    Tuple,
     Type,
     Union,
     Dict,
@@ -43,41 +36,52 @@ if TYPE_CHECKING:
     from ...server import Server
     from ...confighelper import ConfigHelper
     from ...common import WebRequest
-    from ...klippy_connection import KlippyConnection
+    from ..klippy_connection import KlippyConnection
     from ..shell_command import ShellCommandFactory as SCMDComp
     from ..database import MoonrakerDatabase as DBComp
     from ..database import NamespaceWrapper
-    from ..dbus_manager import DbusManager
     from ..machine import Machine
     from ..http_client import HttpClient
-    from ..file_manager.file_manager import FileManager
     from ...eventloop import FlexTimer
-    from dbus_next import Variant
-    from dbus_next.aio import ProxyInterface
     JsonType = Union[List[Any], Dict[str, Any]]
     _T = TypeVar("_T")
 
 # Check To see if Updates are necessary each hour
 UPDATE_REFRESH_INTERVAL = 3600.
-# Perform auto refresh no later than 4am
-MAX_UPDATE_HOUR = 4
 
-def get_deploy_class(type: str, default: _T) -> Union[Type[BaseDeploy], _T]:
+def get_deploy_class(
+    app_type: Union[AppType, str], default: _T
+) -> Union[Type[BaseDeploy], _T]:
+    key = AppType.from_string(app_type) if isinstance(app_type, str) else app_type
     _deployers = {
-        "web": WebClientDeploy,
-        "git_repo": GitDeploy,
-        "zip": ZipDeploy
+        AppType.WEB: ZipDeploy,
+        AppType.GIT_REPO: GitDeploy,
+        AppType.ZIP: ZipDeploy
     }
-    return _deployers.get(type, default)
+    return _deployers.get(key, default)
 
 class UpdateManager:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
+        self.instance_tracker = InstanceTracker(self.server)
         self.kconn: KlippyConnection
         self.kconn = self.server.lookup_component("klippy_connection")
-        self.app_config = base_config.get_base_configuration(config)
+        self.app_config = get_base_configuration(config)
+
         auto_refresh_enabled = config.getboolean('enable_auto_refresh', False)
+        self.refresh_window = config.getintlist('refresh_window', [0, 5],
+                                                separator='-', count=2)
+        if (
+            not (0 <= self.refresh_window[0] <= 23) or
+            not (0 <= self.refresh_window[1] <= 23)
+        ):
+            raise config.error("The hours specified in 'refresh_window'"
+                               " must be between 0 and 23.")
+        if self.refresh_window[0] == self.refresh_window[1]:
+            raise config.error("The start and end hours specified"
+                               " in 'refresh_window' cannot be the same.")
+
         self.cmd_helper = CommandHelper(config, self.get_updaters)
         self.updaters: Dict[str, BaseDeploy] = {}
         if config.getboolean('enable_system_updates', True):
@@ -138,29 +142,32 @@ class UpdateManager:
                 self._handle_auto_refresh)
 
         self.server.register_endpoint(
-            "/machine/update/moonraker", ["POST"],
-            self._handle_update_request)
+            "/machine/update/moonraker", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/klipper", ["POST"],
-            self._handle_update_request)
+            "/machine/update/klipper", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/system", ["POST"],
-            self._handle_update_request)
+            "/machine/update/system", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/client", ["POST"],
-            self._handle_update_request)
+            "/machine/update/client", RequestType.POST, self._handle_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/full", ["POST"],
-            self._handle_full_update_request)
+            "/machine/update/full", RequestType.POST, self._handle_full_update_request
+        )
         self.server.register_endpoint(
-            "/machine/update/status", ["GET"],
-            self._handle_status_request)
+            "/machine/update/status", RequestType.GET, self._handle_status_request
+        )
         self.server.register_endpoint(
-            "/machine/update/refresh", ["POST"],
-            self._handle_refresh_request)
+            "/machine/update/refresh", RequestType.POST, self._handle_refresh_request
+        )
         self.server.register_endpoint(
-            "/machine/update/recover", ["POST"],
-            self._handle_repo_recovery)
+            "/machine/update/recover", RequestType.POST, self._handle_repo_recovery
+        )
+        self.server.register_endpoint(
+            "/machine/update/rollback", RequestType.POST, self._handle_rollback
+        )
         self.server.register_notification("update_manager:update_response")
         self.server.register_notification("update_manager:update_refreshed")
 
@@ -172,6 +179,7 @@ class UpdateManager:
         return self.updaters
 
     async def component_init(self) -> None:
+        self.instance_tracker.set_instance_id()
         # Prune stale data from the database
         umdb = self.cmd_helper.get_umdb()
         db_keys = await umdb.keys()
@@ -198,41 +206,51 @@ class UpdateManager:
         kpath: str = kinfo['klipper_path']
         executable: str = kinfo['python_path']
         kupdater = self.updaters.get('klipper')
+        app_type = get_app_type(kpath)
         if (
-            isinstance(kupdater, AppDeploy) and
-            kupdater.check_same_paths(kpath, executable)
+            (isinstance(kupdater, AppDeploy) and
+             kupdater.check_same_paths(kpath, executable)) or
+            (app_type == AppType.NONE and type(kupdater) is BaseDeploy)
         ):
-            # Current Klipper Updater is valid
+            # Current Klipper Updater is valid or unnecessary
             return
         # Update paths in the database
         db: DBComp = self.server.lookup_component('database')
         db.insert_item("moonraker", "update_manager.klipper_path", kpath)
         db.insert_item("moonraker", "update_manager.klipper_exec", executable)
-        app_type = base_config.get_app_type(kpath)
         kcfg = self.app_config["klipper"]
         kcfg.set_option("path", kpath)
         kcfg.set_option("env", executable)
-        kcfg.set_option("type", app_type)
-        need_notification = not isinstance(kupdater, AppDeploy)
+        kcfg.set_option("type", str(app_type))
+        notify = not isinstance(kupdater, AppDeploy)
         kclass = get_deploy_class(app_type, BaseDeploy)
-        self.updaters['klipper'] = kclass(kcfg, self.cmd_helper)
-        coro = self._update_klipper_repo(need_notification)
+        coro = self._update_klipper_repo(kclass(kcfg, self.cmd_helper), notify)
         self.event_loop.create_task(coro)
 
-    async def _update_klipper_repo(self, notify: bool) -> None:
+    async def _update_klipper_repo(self, updater: BaseDeploy, notify: bool) -> None:
         async with self.cmd_request_lock:
+            self.updaters['klipper'] = updater
             umdb = self.cmd_helper.get_umdb()
             await umdb.pop('klipper', None)
-            await self.updaters['klipper'].initialize()
-            await self.updaters['klipper'].refresh()
+            await updater.initialize()
+            await updater.refresh()
         if notify:
             self.cmd_helper.notify_update_refreshed()
 
-    async def _handle_auto_refresh(self, eventtime: float) -> float:
+    def _is_within_refresh_window(self) -> bool:
         cur_hour = time.localtime(time.time()).tm_hour
+        if self.refresh_window[0] < self.refresh_window[1]:
+            return self.refresh_window[0] <= cur_hour < self.refresh_window[1]
+        return cur_hour >= self.refresh_window[0] or cur_hour < self.refresh_window[1]
+
+    async def _handle_auto_refresh(self, eventtime: float) -> float:
+        log_remaining_time = True
         if self.initial_refresh_complete:
-            # Update when the local time is between 12AM and 5AM
-            if cur_hour >= MAX_UPDATE_HOUR:
+            log_remaining_time = False
+            # Update only if within the refresh window
+            if not self._is_within_refresh_window():
+                logging.debug("update_manager: current time is outside of"
+                              " the refresh window, auto refresh rescheduled")
                 return eventtime + UPDATE_REFRESH_INTERVAL
             if self.kconn.is_printing():
                 # Don't Refresh during a print
@@ -250,7 +268,7 @@ class UpdateManager:
         async with self.cmd_request_lock:
             try:
                 for name, updater in list(self.updaters.items()):
-                    if updater.needs_refresh():
+                    if updater.needs_refresh(log_remaining_time):
                         await updater.refresh()
                         need_notify = True
             except Exception:
@@ -431,9 +449,7 @@ class UpdateManager:
             )
         return ret
 
-    async def _handle_repo_recovery(self,
-                                    web_request: WebRequest
-                                    ) -> str:
+    async def _handle_repo_recovery(self, web_request: WebRequest) -> str:
         if self.kconn.is_printing():
             raise self.server.error(
                 "Recovery Attempt Refused: Klippy is printing")
@@ -459,9 +475,33 @@ class UpdateManager:
                 self.cmd_helper.clear_update_info()
         return "ok"
 
-    def close(self) -> None:
+    async def _handle_rollback(self, web_request: WebRequest) -> str:
+        if self.kconn.is_printing():
+            raise self.server.error("Rollback Attempt Refused: Klippy is printing")
+        app: str = web_request.get_str('name')
+        updater = self.updaters.get(app, None)
+        if updater is None:
+            raise self.server.error(f"Updater {app} not available", 404)
+        async with self.cmd_request_lock:
+            self.cmd_helper.set_update_info(f"rollback_{app}", id(web_request))
+            try:
+                await updater.rollback()
+            except Exception as e:
+                self.cmd_helper.notify_update_response(f"Error Rolling Back {app}")
+                self.cmd_helper.notify_update_response(str(e), is_complete=True)
+                raise
+            finally:
+                self.cmd_helper.clear_update_info()
+        return "ok"
+
+    async def close(self) -> None:
         if self.refresh_timer is not None:
             self.refresh_timer.stop()
+        self.instance_tracker.close()
+        for updater in self.updaters.values():
+            ret = updater.close()
+            if ret is not None:
+                await ret
 
 class CommandHelper:
     def __init__(
@@ -476,10 +516,6 @@ class CommandHelper:
         config.getboolean('enable_repo_debug', False, deprecate=True)
         if self.server.is_debug_enabled():
             logging.warning("UPDATE MANAGER: REPO DEBUG ENABLED")
-        shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
-        self.scmd_error = shell_cmd.error
-        self.build_shell_command = shell_cmd.build_shell_command
-        self.run_cmd_with_response = shell_cmd.exec_cmd
         self.pkg_updater: Optional[PackageDeploy] = None
 
         # database management
@@ -506,6 +542,9 @@ class CommandHelper:
 
     def get_server(self) -> Server:
         return self.server
+
+    def get_shell_command(self) -> SCMDComp:
+        return self.server.lookup_component("shell_command")
 
     def get_http_client(self) -> HttpClient:
         return self.http_client
@@ -559,18 +598,18 @@ class CommandHelper:
         cmd: str,
         timeout: float = 20.,
         notify: bool = False,
-        retries: int = 1,
+        attempts: int = 1,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
-        sig_idx: int = 1
+        sig_idx: int = 1,
+        log_stderr: bool = False
     ) -> None:
         cb = self.notify_update_response if notify else None
-        scmd = self.build_shell_command(cmd, callback=cb, env=env, cwd=cwd)
-        for _ in range(retries):
-            if await scmd.run(timeout=timeout, sig_idx=sig_idx):
-                break
-        else:
-            raise self.server.error("Shell Command Error")
+        log_stderr |= self.server.is_verbose_enabled()
+        await self.get_shell_command().run_cmd_async(
+            cmd, cb, timeout=timeout, attempts=attempts,
+            env=env, cwd=cwd, sig_idx=sig_idx, log_stderr=log_stderr
+        )
 
     def notify_update_refreshed(self) -> None:
         vinfo: Dict[str, Any] = {}
@@ -629,827 +668,92 @@ class CommandHelper:
         eventloop = self.server.get_event_loop()
         return await eventloop.run_in_thread(_createdir, suffix, prefix)
 
-class PackageDeploy(BaseDeploy):
-    def __init__(self,
-                 config: ConfigHelper,
-                 cmd_helper: CommandHelper
-                 ) -> None:
-        super().__init__(config, cmd_helper, "system", "", "")
-        cmd_helper.set_package_updater(self)
-        self.use_packagekit = config.getboolean("enable_packagekit", True)
-        self.available_packages: List[str] = []
+class InstanceTracker:
+    def __init__(self, server: Server) -> None:
+        self.server = server
+        self.inst_id = b""
+        self.shm = self._try_open_shm()
 
-    async def initialize(self) -> Dict[str, Any]:
-        storage = await super().initialize()
-        self.available_packages = storage.get('packages', [])
-        provider: BasePackageProvider
-        try_fallback = True
-        if self.use_packagekit:
+    def _try_open_shm(self) -> Any:
+        prev_mask = os.umask(0)
+        try:
+            from multiprocessing.shared_memory import SharedMemory
+            setattr(SharedMemory, "_mode", 438)
             try:
-                provider = PackageKitProvider(self.cmd_helper)
-                await provider.initialize()
+                return SharedMemory("moonraker_instance_ids", True, 4096)
+            except FileExistsError:
+                return SharedMemory("moonraker_instance_ids")
+        except Exception as e:
+            self.server.add_log_rollover_item(
+                "um_multi_instance_msg",
+                "Failed to open shared memory, update_manager instance tracking "
+                f"disabled.\n{e.__class__.__name__}: {e}"
+            )
+            return None
+        finally:
+            os.umask(prev_mask)
+
+    def get_instance_id(self) -> bytes:
+        machine: Machine = self.server.lookup_component("machine")
+        cur_name = "".join(machine.unit_name.split())
+        cur_uuid: str = self.server.get_app_args()["instance_uuid"]
+        pid = os.getpid()
+        return f"{cur_name}:{cur_uuid}:{pid}".encode(errors="ignore")
+
+    def _read_instance_ids(self) -> List[bytes]:
+        if self.shm is not None:
+            try:
+                data = bytearray(self.shm.buf)
+                idx = data.find(b"\x00")
+                if idx > 1:
+                    return bytes(data[:idx]).strip().splitlines()
             except Exception:
-                pass
-            else:
-                logging.info("PackageDeploy: Using PackageKit Provider")
-                try_fallback = False
-        if try_fallback:
-            # Check to see of the apt command is available
-            fallback = await self._get_fallback_provider()
-            if fallback is None:
-                provider = BasePackageProvider(self.cmd_helper)
-                machine: Machine = self.server.lookup_component("machine")
-                dist_info = machine.get_system_info()['distribution']
-                dist_id: str = dist_info['id'].lower()
-                self.server.add_warning(
-                    "Unable to initialize System Update Provider for "
-                    f"distribution: {dist_id}")
-            else:
-                logging.info("PackageDeploy: Using APT CLI Provider")
-                provider = fallback
-        self.provider = provider
-        return storage
-
-    async def _get_fallback_provider(self) -> Optional[BasePackageProvider]:
-        # Currently only the API Fallback provider is available
-        shell_cmd: SCMDComp
-        shell_cmd = self.server.lookup_component("shell_command")
-        cmd = shell_cmd.build_shell_command("sh -c 'command -v apt'")
-        try:
-            ret = await cmd.run_with_response()
-        except shell_cmd.error:
-            return None
-        # APT Command found should be available
-        logging.debug(f"APT package manager detected: {ret}")
-        provider = AptCliProvider(self.cmd_helper)
-        try:
-            await provider.initialize()
-        except Exception:
-            return None
-        return provider
-
-    async def refresh(self) -> None:
-        try:
-            # Do not force a refresh until the server has started
-            if self.server.is_running():
-                await self._update_package_cache(force=True)
-            self.available_packages = await self.provider.get_packages()
-            pkg_msg = "\n".join(self.available_packages)
-            logging.info(
-                f"Detected {len(self.available_packages)} package updates:"
-                f"\n{pkg_msg}")
-        except Exception:
-            logging.exception("Error Refreshing System Packages")
-        # Update Persistent Storage
-        self._save_state()
-
-    def get_persistent_data(self) -> Dict[str, Any]:
-        storage = super().get_persistent_data()
-        storage['packages'] = self.available_packages
-        return storage
-
-    async def update(self) -> bool:
-        if not self.available_packages:
-            return False
-        self.cmd_helper.notify_update_response("Updating packages...")
-        try:
-            await self._update_package_cache(force=True, notify=True)
-            await self.provider.upgrade_system()
-        except Exception:
-            raise self.server.error("Error updating system packages")
-        self.available_packages = []
-        self._save_state()
-        self.cmd_helper.notify_update_response(
-            "Package update finished...", is_complete=True)
-        return True
-
-    async def _update_package_cache(self,
-                                    force: bool = False,
-                                    notify: bool = False
-                                    ) -> None:
-        curtime = time.time()
-        if force or curtime > self.last_refresh_time + 3600.:
-            # Don't update if a request was done within the last hour
-            await self.provider.refresh_packages(notify)
-
-    async def install_packages(self,
-                               package_list: List[str],
-                               **kwargs
-                               ) -> None:
-        await self.provider.install_packages(package_list, **kwargs)
-
-    def get_update_status(self) -> Dict[str, Any]:
-        return {
-            'package_count': len(self.available_packages),
-            'package_list': self.available_packages
-        }
-
-class BasePackageProvider:
-    def __init__(self, cmd_helper: CommandHelper) -> None:
-        self.server = cmd_helper.get_server()
-        self.cmd_helper = cmd_helper
-
-    async def initialize(self) -> None:
-        pass
-
-    async def refresh_packages(self, notify: bool = False) -> None:
-        raise self.server.error("Cannot refresh packages, no provider set")
-
-    async def get_packages(self) -> List[str]:
-        raise self.server.error("Cannot retrieve packages, no provider set")
-
-    async def install_packages(self,
-                               package_list: List[str],
-                               **kwargs
-                               ) -> None:
-        raise self.server.error("Cannot install packages, no provider set")
-
-    async def upgrade_system(self) -> None:
-        raise self.server.error("Cannot upgrade packages, no provider set")
-
-class AptCliProvider(BasePackageProvider):
-    APT_CMD = "sudo DEBIAN_FRONTEND=noninteractive apt-get"
-
-    async def refresh_packages(self, notify: bool = False) -> None:
-        await self.cmd_helper.run_cmd(
-            f"{self.APT_CMD} update", timeout=600., notify=notify)
-
-    async def get_packages(self) -> List[str]:
-        res = await self.cmd_helper.run_cmd_with_response(
-            "apt list --upgradable", timeout=60.)
-        pkg_list = [p.strip() for p in res.split("\n") if p.strip()]
-        if pkg_list:
-            pkg_list = pkg_list[2:]
-            return [p.split("/", maxsplit=1)[0] for p in pkg_list]
+                logging.exception("Failed to Read Shared Memory")
         return []
 
-    async def resolve_packages(self, package_list: List[str]) -> List[str]:
-        self.cmd_helper.notify_update_response("Resolving packages...")
-        search_regex = "|".join([f"^{pkg}$" for pkg in package_list])
-        cmd = f"apt-cache search --names-only \"{search_regex}\""
-        ret = await self.cmd_helper.run_cmd_with_response(cmd, timeout=600.)
-        resolved = [
-            pkg.strip().split()[0] for pkg in ret.split("\n") if pkg.strip()
-        ]
-        return [avail for avail in package_list if avail in resolved]
-
-    async def install_packages(self,
-                               package_list: List[str],
-                               **kwargs
-                               ) -> None:
-        timeout: float = kwargs.get('timeout', 300.)
-        retries: int = kwargs.get('retries', 3)
-        notify: bool = kwargs.get('notify', False)
-        await self.refresh_packages(notify=notify)
-        resolved = await self.resolve_packages(package_list)
-        if not resolved:
-            self.cmd_helper.notify_update_response("No packages detected")
+    def set_instance_id(self) -> None:
+        if self.shm is None:
             return
-        logging.debug(f"Resolved packages: {resolved}")
-        pkgs = " ".join(resolved)
-        await self.cmd_helper.run_cmd(
-            f"{self.APT_CMD} install --yes {pkgs}", timeout=timeout,
-            retries=retries, notify=notify)
-
-    async def upgrade_system(self) -> None:
-        await self.cmd_helper.run_cmd(
-            f"{self.APT_CMD} upgrade --yes", timeout=3600.,
-            notify=True)
-
-class PackageKitProvider(BasePackageProvider):
-    def __init__(self, cmd_helper: CommandHelper) -> None:
-        super().__init__(cmd_helper)
-        dbus_mgr: DbusManager = self.server.lookup_component("dbus_manager")
-        self.dbus_mgr = dbus_mgr
-        self.pkgkit: Optional[ProxyInterface] = None
-
-    async def initialize(self) -> None:
-        if not self.dbus_mgr.is_connected():
-            raise self.server.error("DBus Connection Not available")
-        # Check for PolicyKit permissions
-        await self.dbus_mgr.check_permission(
-            "org.freedesktop.packagekit.system-sources-refresh",
-            "The Update Manager will fail to fetch package updates")
-        await self.dbus_mgr.check_permission(
-            "org.freedesktop.packagekit.package-install",
-            "The Update Manager will fail to install packages")
-        await self.dbus_mgr.check_permission(
-            "org.freedesktop.packagekit.system-update",
-            "The Update Manager will fail to update packages"
-        )
-        # Fetch the PackageKit DBus Inteface
-        self.pkgkit = await self.dbus_mgr.get_interface(
-            "org.freedesktop.PackageKit",
-            "/org/freedesktop/PackageKit",
-            "org.freedesktop.PackageKit")
-
-    async def refresh_packages(self, notify: bool = False) -> None:
-        await self.run_transaction("refresh_cache", False, notify=notify)
-
-    async def get_packages(self) -> List[str]:
-        flags = PkEnum.Filter.NONE
-        pkgs = await self.run_transaction("get_updates", flags.value)
-        pkg_ids = [info['package_id'] for info in pkgs if 'package_id' in info]
-        return [pkg_id.split(";")[0] for pkg_id in pkg_ids]
-
-    async def install_packages(self,
-                               package_list: List[str],
-                               **kwargs
-                               ) -> None:
-        notify: bool = kwargs.get('notify', False)
-        await self.refresh_packages(notify=notify)
-        flags = (
-            PkEnum.Filter.NEWEST | PkEnum.Filter.NOT_INSTALLED |
-            PkEnum.Filter.BASENAME | PkEnum.Filter.ARCH
-        )
-        pkgs = await self.run_transaction("resolve", flags.value, package_list)
-        pkg_ids = [info['package_id'] for info in pkgs if 'package_id' in info]
-        if pkg_ids:
-            logging.debug(f"Installing Packages: {pkg_ids}")
-            tflag = PkEnum.TransactionFlag.ONLY_TRUSTED
-            await self.run_transaction("install_packages", tflag.value,
-                                       pkg_ids, notify=notify)
-
-    async def upgrade_system(self) -> None:
-        # Get Updates, Install Packages
-        flags = PkEnum.Filter.NONE
-        pkgs = await self.run_transaction("get_updates", flags.value)
-        pkg_ids = [info['package_id'] for info in pkgs if 'package_id' in info]
-        if pkg_ids:
-            logging.debug(f"Upgrading Packages: {pkg_ids}")
-            tflag = PkEnum.TransactionFlag.ONLY_TRUSTED
-            await self.run_transaction("update_packages", tflag.value,
-                                       pkg_ids, notify=True)
-
-    def create_transaction(self) -> PackageKitTransaction:
-        if self.pkgkit is None:
-            raise self.server.error("PackageKit Interface Not Available")
-        return PackageKitTransaction(self.dbus_mgr, self.pkgkit,
-                                     self.cmd_helper)
-
-    async def run_transaction(self,
-                              method: str,
-                              *args,
-                              notify: bool = False
-                              ) -> Any:
-        transaction = self.create_transaction()
-        return await transaction.run(method, *args, notify=notify)
-
-class PackageKitTransaction:
-    GET_PKG_ROLES = (
-        PkEnum.Role.RESOLVE | PkEnum.Role.GET_PACKAGES |
-        PkEnum.Role.GET_UPDATES
-    )
-    QUERY_ROLES = GET_PKG_ROLES | PkEnum.Role.GET_REPO_LIST
-    PROGRESS_STATUS = (
-        PkEnum.Status.RUNNING | PkEnum.Status.INSTALL |
-        PkEnum.Status.UPDATE
-    )
-
-    def __init__(self,
-                 dbus_mgr: DbusManager,
-                 pkgkit: ProxyInterface,
-                 cmd_helper: CommandHelper
-                 ) -> None:
-        self.server = cmd_helper.get_server()
-        self.eventloop = self.server.get_event_loop()
-        self.cmd_helper = cmd_helper
-        self.dbus_mgr = dbus_mgr
-        self.pkgkit = pkgkit
-        # Transaction Properties
-        self.notify = False
-        self._status = PkEnum.Status.UNKNOWN
-        self._role = PkEnum.Role.UNKNOWN
-        self._tflags = PkEnum.TransactionFlag.NONE
-        self._percentage = 101
-        self._dl_remaining = 0
-        self.speed = 0
-        self.elapsed_time = 0
-        self.remaining_time = 0
-        self.caller_active = False
-        self.allow_cancel = True
-        self.uid = 0
-        # Transaction data tracking
-        self.tfut: Optional[asyncio.Future] = None
-        self.last_progress_notify_time: float = 0.
-        self.result: List[Dict[str, Any]] = []
-        self.err_msg: str = ""
-
-    def run(self,
-            method: str,
-            *args,
-            notify: bool = False
-            ) -> Awaitable:
-        if self.tfut is not None:
-            raise self.server.error(
-                "PackageKit transaction can only be used once")
-        self.notify = notify
-        self.tfut = self.eventloop.create_future()
-        coro = self._start_transaction(method, *args)
-        self.eventloop.create_task(coro)
-        return self.tfut
-
-    async def _start_transaction(self,
-                                 method: str,
-                                 *args
-                                 ) -> None:
-        assert self.tfut is not None
-        try:
-            # Create Transaction
-            tid = await self.pkgkit.call_create_transaction()  # type: ignore
-            transaction, props = await self.dbus_mgr.get_interfaces(
-                "org.freedesktop.PackageKit", tid,
-                ["org.freedesktop.PackageKit.Transaction",
-                 "org.freedesktop.DBus.Properties"])
-            # Set interface callbacks
-            transaction.on_package(self._on_package_signal)    # type: ignore
-            transaction.on_repo_detail(                        # type: ignore
-                self._on_repo_detail_signal)
-            transaction.on_item_progress(                      # type: ignore
-                self._on_item_progress_signal)
-            transaction.on_error_code(self._on_error_signal)   # type: ignore
-            transaction.on_finished(self._on_finished_signal)  # type: ignore
-            props.on_properties_changed(                       # type: ignore
-                self._on_properties_changed)
-            # Run method
-            logging.debug(f"PackageKit: Running transaction call_{method}")
-            func = getattr(transaction, f"call_{method}")
-            await func(*args)
-        except Exception as e:
-            self.tfut.set_exception(e)
-
-    def _on_package_signal(self,
-                           info_code: int,
-                           package_id: str,
-                           summary: str
-                           ) -> None:
-        info = PkEnum.Info.from_index(info_code)
-        if self._role in self.GET_PKG_ROLES:
-            pkg_data = {
-                'package_id': package_id,
-                'info': info.desc,
-                'summary': summary
-            }
-            self.result.append(pkg_data)
-        else:
-            self._notify_package(info, package_id)
-
-    def _on_repo_detail_signal(self,
-                               repo_id: str,
-                               description: str,
-                               enabled: bool
-                               ) -> None:
-        if self._role == PkEnum.Role.GET_REPO_LIST:
-            repo_data = {
-                "repo_id": repo_id,
-                "description": description,
-                "enabled": enabled
-            }
-            self.result.append(repo_data)
-        else:
-            self._notify_repo(repo_id, description)
-
-    def _on_item_progress_signal(self,
-                                 item_id: str,
-                                 status_code: int,
-                                 percent_complete: int
-                                 ) -> None:
-        status = PkEnum.Status.from_index(status_code)
-        # NOTE: This signal doesn't seem to fire predictably,
-        # nor does it seem to provide a consistent "percent complete"
-        # parameter.
-        # logging.debug(
-        #    f"Role {self._role.name}: Item Progress Signal Received\n"
-        #    f"Item ID: {item_id}\n"
-        #    f"Percent Complete: {percent_complete}\n"
-        #    f"Status: {status.desc}")
-
-    def _on_error_signal(self,
-                         error_code: int,
-                         details: str
-                         ) -> None:
-        err = PkEnum.Error.from_index(error_code)
-        self.err_msg = f"{err.name}: {details}"
-
-    def _on_finished_signal(self, exit_code: int, run_time: int) -> None:
-        if self.tfut is None:
+        self.inst_id = self.get_instance_id()
+        iids = self._read_instance_ids()
+        if self.inst_id not in iids:
+            iids.append(self.inst_id)
+        if len(iids) > 1:
+            id_str = "\n".join([iid.decode(errors="ignore") for iid in iids])
+            self.server.add_log_rollover_item(
+                "um_multi_instance_msg",
+                "Multiple instances of Moonraker have the update manager enabled."
+                f"\n{id_str}"
+            )
+        encoded_ids = b"\n".join(iids) + b"\x00"
+        if len(encoded_ids) > self.shm.size:
+            iid = self.inst_id.decode(errors="ignore")
+            logging.info(f"Not enough storage in shared memory for id {iid}")
             return
-        ext = PkEnum.Exit.from_index(exit_code)
-        secs = run_time / 1000.
-        if ext == PkEnum.Exit.SUCCESS:
-            self.tfut.set_result(self.result)
-        else:
-            err = self.err_msg or ext.desc
-            server = self.cmd_helper.get_server()
-            self.tfut.set_exception(server.error(err))
-        msg = f"Transaction {self._role.desc}: Exit {ext.desc}, " \
-              f"Run time: {secs:.2f} seconds"
-        if self.notify:
-            self.cmd_helper.notify_update_response(msg)
-        logging.debug(msg)
-
-    def _on_properties_changed(self,
-                               iface_name: str,
-                               changed_props: Dict[str, Variant],
-                               invalid_props: Dict[str, Variant]
-                               ) -> None:
-        for name, var in changed_props.items():
-            formatted = re.sub(r"(\w)([A-Z])", r"\g<1>_\g<2>", name).lower()
-            setattr(self, formatted, var.value)
-
-    def _notify_package(self, info: PkEnum.Info, package_id: str) -> None:
-        if self.notify:
-            if info == PkEnum.Info.FINISHED:
-                return
-            pkg_parts = package_id.split(";")
-            msg = f"{info.desc}: {pkg_parts[0]} ({pkg_parts[1]})"
-            self.cmd_helper.notify_update_response(msg)
-
-    def _notify_repo(self, repo_id: str, description: str) -> None:
-        if self.notify:
-            if not repo_id.strip():
-                repo_id = description
-            # TODO: May want to eliminate dups
-            msg = f"GET: {repo_id}"
-            self.cmd_helper.notify_update_response(msg)
-
-    def _notify_progress(self) -> None:
-        if self.notify and self._percentage <= 100:
-            msg = f"{self._status.desc}...{self._percentage}%"
-            if self._status == PkEnum.Status.DOWNLOAD and self._dl_remaining:
-                if self._dl_remaining < 1024:
-                    msg += f", Remaining: {self._dl_remaining} B"
-                elif self._dl_remaining < 1048576:
-                    msg += f", Remaining: {self._dl_remaining // 1024} KiB"
-                else:
-                    msg += f", Remaining: {self._dl_remaining // 1048576} MiB"
-                if self.speed:
-                    speed = self.speed // 8
-                    if speed < 1024:
-                        msg += f", Speed: {speed} B/s"
-                    elif speed < 1048576:
-                        msg += f", Speed: {speed // 1024} KiB/s"
-                    else:
-                        msg += f", Speed: {speed // 1048576} MiB/s"
-            self.cmd_helper.notify_update_response(msg)
-
-    @property
-    def role(self) -> PkEnum.Role:
-        return self._role
-
-    @role.setter
-    def role(self, role_code: int) -> None:
-        self._role = PkEnum.Role.from_index(role_code)
-        if self._role in self.QUERY_ROLES:
-            # Never Notify Queries
-            self.notify = False
-        if self.notify:
-            msg = f"Transaction {self._role.desc} started..."
-            self.cmd_helper.notify_update_response(msg)
-        logging.debug(f"PackageKit: Current Role: {self._role.desc}")
-
-    @property
-    def status(self) -> PkEnum.Status:
-        return self._status
-
-    @status.setter
-    def status(self, status_code: int) -> None:
-        self._status = PkEnum.Status.from_index(status_code)
-        self._percentage = 101
-        self.speed = 0
-        logging.debug(f"PackageKit: Current Status: {self._status.desc}")
-
-    @property
-    def transaction_flags(self) -> PkEnum.TransactionFlag:
-        return self._tflags
-
-    @transaction_flags.setter
-    def transaction_flags(self, bits: int) -> None:
-        self._tflags = PkEnum.TransactionFlag(bits)
-
-    @property
-    def percentage(self) -> int:
-        return self._percentage
-
-    @percentage.setter
-    def percentage(self, percent: int) -> None:
-        self._percentage = percent
-        if self._status in self.PROGRESS_STATUS:
-            self._notify_progress()
-
-    @property
-    def download_size_remaining(self) -> int:
-        return self._dl_remaining
-
-    @download_size_remaining.setter
-    def download_size_remaining(self, bytes_remaining: int) -> None:
-        self._dl_remaining = bytes_remaining
-        self._notify_progress()
-
-
-class WebClientDeploy(BaseDeploy):
-    def __init__(self,
-                 config: ConfigHelper,
-                 cmd_helper: CommandHelper
-                 ) -> None:
-        super().__init__(config, cmd_helper, prefix="Web Client")
-        self.repo = config.get('repo').strip().strip("/")
-        self.owner, self.project_name = self.repo.split("/", 1)
-        self.path = pathlib.Path(config.get("path")).expanduser().resolve()
-        self.type = config.get('type')
-        self.channel = config.get("channel", "stable")
-        if self.channel not in ["stable", "beta"]:
-            raise config.error(
-                f"Invalid Channel '{self.channel}' for config "
-                f"section [{config.get_name()}], type: {self.type}. "
-                f"Must be one of the following: stable, beta")
-        self.info_tags: List[str] = config.getlist("info_tags", [])
-        self.persistent_files: List[str] = []
-        self.warnings: List[str] = []
-        self.version: str = "?"
-        pfiles = config.getlist('persistent_files', None)
-        if pfiles is not None:
-            self.persistent_files = [pf.strip("/") for pf in pfiles]
-            if ".version" in self.persistent_files:
-                raise config.error(
-                    "Invalid value for option 'persistent_files': "
-                    "'.version' can not be persistent")
-        self._valid: bool = True
-        self._is_prerelease: bool = False
-        self._is_fallback: bool = False
-        self._path_writable: bool = False
-
-    async def _validate_client_info(self) -> None:
-        self._valid = False
-        self._is_fallback = False
-        eventloop = self.server.get_event_loop()
-        self.warnings.clear()
-        if not self._path_writable:
-            self.warnings.append(
-                f"Location at option 'path: {self.path}' is not writable."
-            )
-        elif not self.path.is_dir():
-            self.warnings.append(
-                f"Location at option 'path: {self.path}' does not exist."
-            )
-        elif source_info.within_git_repo(self.path):
-            self.warnings.append(
-                f"Location at option 'path: {self.path}' is a git repo."
-            )
-        else:
-            rinfo = self.path.joinpath("release_info.json")
-            if rinfo.is_file():
-                try:
-                    data = await eventloop.run_in_thread(rinfo.read_text)
-                    uinfo: Dict[str, str] = json.loads(data)
-                    project_name = uinfo["project_name"]
-                    owner = uinfo["project_owner"]
-                    self.version = uinfo["version"]
-                except Exception:
-                    logging.exception("Failed to load release_info.json.")
-                else:
-                    self._valid = True
-                    detected_repo = f"{owner}/{project_name}"
-                    if self.repo.lower() != detected_repo.lower():
-                        self.warnings.append(
-                            f"Value at option 'repo: {self.repo}' does not match "
-                            f"detected repo '{detected_repo}', falling back to "
-                            "detected version."
-                        )
-                        self.repo = detected_repo
-                        self.owner = owner
-                        self.project_name = project_name
-            else:
-                version_path = self.path.joinpath(".version")
-                if version_path.is_file():
-                    version = await eventloop.run_in_thread(version_path.read_text)
-                    self.version = version.strip()
-                self._valid = await self._detect_fallback()
-        if not self._valid:
-            self.warnings.append("Failed to validate client installation")
-            if self.server.is_debug_enabled():
-                self.log_info("Debug Enabled, overriding validity checks")
-
-    async def _detect_fallback(self) -> bool:
-        fallback_defs = {
-            "mainsail": "mainsail-crew",
-            "fluidd": "fluidd-core"
-        }
-        for fname in ("manifest.json", "manifest.webmanifest"):
-            manifest = self.path.joinpath(fname)
-            eventloop = self.server.get_event_loop()
-            if manifest.is_file():
-                try:
-                    mtext = await eventloop.run_in_thread(manifest.read_text)
-                    mdata: Dict[str, Any] = json.loads(mtext)
-                    proj_name: str = mdata["name"].lower()
-                except Exception:
-                    self.log_exc(f"Failed to load json from {manifest}")
-                    continue
-                if proj_name in fallback_defs:
-                    owner = fallback_defs[proj_name]
-                    detected_repo = f"{owner}/{proj_name}"
-                    if detected_repo != self.repo.lower():
-                        self.warnings.append(
-                            f"Value at option 'repo: {self.repo}' does not match "
-                            f"detected repo '{detected_repo}', falling back to "
-                            "detected version."
-                        )
-                        self.repo = detected_repo
-                        self.owner = owner
-                        self.project_name = proj_name
-                    self._is_fallback = True
-                    return True
-        return False
-
-    async def initialize(self) -> Dict[str, Any]:
-        fm: FileManager = self.server.lookup_component("file_manager")
-        self._path_writable = not fm.check_reserved_path(
-            self.path, need_write=True, raise_error=False
-        )
-        if self._path_writable:
-            fm.add_reserved_path(f"update_manager {self.name}", self.path)
-        await self._validate_client_info()
-        storage = await super().initialize()
-        if self.version == "?":
-            self.version = storage.get("version", "?")
-        self.remote_version: str = storage.get('remote_version', "?")
-        self.last_error: str = storage.get('last_error', "")
-        dl_info: List[Any] = storage.get('dl_info', ["?", "?", 0])
-        self.dl_info: Tuple[str, str, int] = cast(
-            Tuple[str, str, int], tuple(dl_info))
-        if not self.needs_refresh():
-            self._log_client_info()
-        return storage
-
-    def _log_client_info(self) -> None:
-        warn_str = ""
-        if self.warnings:
-            warn_str = "\nWarnings:\n"
-            warn_str += "\n".join([f" {item}" for item in self.warnings])
-        dl_url, content_type, size = self.dl_info
-        logging.info(
-            f"Web Client {self.name} Detected:\n"
-            f"Repo: {self.repo}\n"
-            f"Channel: {self.channel}\n"
-            f"Path: {self.path}\n"
-            f"Local Version: {self.version}\n"
-            f"Remote Version: {self.remote_version}\n"
-            f"Valid: {self._valid}\n"
-            f"Fallback Client Detected: {self._is_fallback}\n"
-            f"Pre-release: {self._is_prerelease}\n"
-            f"Download Url: {dl_url}\n"
-            f"Download Size: {size}\n"
-            f"Content Type: {content_type}"
-            f"{warn_str}"
-        )
-
-    async def refresh(self) -> None:
         try:
-            if not self._valid:
-                await self._validate_client_info()
-            await self._get_remote_version()
+            buf: memoryview = self.shm.buf
+            buf[:len(encoded_ids)] = encoded_ids
         except Exception:
-            logging.exception("Error Refreshing Client")
-        self._log_client_info()
-        self._save_state()
+            logging.exception("Failed to Write Shared Memory")
 
-    async def _get_remote_version(self) -> None:
-        if not self._valid:
-            self.log_info("Invalid Web Installation, aborting remote refresh")
+    def close(self) -> None:
+        if self.shm is None:
             return
-        # Remote state
-        if self.channel == "stable":
-            resource = f"repos/{self.repo}/releases/latest"
-        else:
-            resource = f"repos/{self.repo}/releases?per_page=1"
-        client = self.cmd_helper.get_http_client()
-        resp = await client.github_api_request(
-            resource, attempts=3, retry_pause_time=.5
-        )
-        release: Union[List[Any], Dict[str, Any]] = {}
-        if resp.status_code == 304:
-            if self.remote_version == "?" and resp.content:
-                # Not modified, however we need to restore state from
-                # cached content
-                release = resp.json()
-            else:
-                # Either not necessary or not possible to restore from cache
-                return
-        elif resp.has_error():
-            logging.info(
-                f"Client {self.repo}: Github Request Error - {resp.error}")
-            self.last_error = str(resp.error)
-            return
-        else:
-            release = resp.json()
-        result: Dict[str, Any] = {}
-        if isinstance(release, list):
-            if release:
-                result = release[0]
-        else:
-            result = release
-        self.last_error = ""
-        self.remote_version = result.get('name', "?")
-        release_asset: Dict[str, Any] = result.get('assets', [{}])[0]
-        dl_url: str = release_asset.get('browser_download_url', "?")
-        content_type: str = release_asset.get('content_type', "?")
-        size: int = release_asset.get('size', 0)
-        self.dl_info = (dl_url, content_type, size)
-        self._is_prerelease = result.get('prerelease', False)
-
-    def get_persistent_data(self) -> Dict[str, Any]:
-        storage = super().get_persistent_data()
-        storage['version'] = self.version
-        storage['remote_version'] = self.remote_version
-        storage['dl_info'] = list(self.dl_info)
-        storage['last_error'] = self.last_error
-        return storage
-
-    async def update(self) -> bool:
-        if not self._valid:
-            raise self.server.error(
-                f"Web Client {self.name}: Invalid install detected, aborting update"
-            )
-        if self.remote_version == "?":
-            await self._get_remote_version()
-            if self.remote_version == "?":
-                raise self.server.error(
-                    f"Client {self.repo}: Unable to locate update")
-        dl_url, content_type, size = self.dl_info
-        if dl_url == "?":
-            raise self.server.error(
-                f"Client {self.repo}: Invalid download url")
-        if self.version == self.remote_version:
-            # Already up to date
-            return False
-        event_loop = self.server.get_event_loop()
-        self.cmd_helper.notify_update_response(
-            f"Updating Web Client {self.name}...")
-        self.cmd_helper.notify_update_response(
-            f"Downloading Client: {self.name}")
-        td = await self.cmd_helper.create_tempdir(self.name, "client")
+        # Remove current id and clean up shared memory
+        iids = self._read_instance_ids()
+        if self.inst_id in iids:
+            iids.remove(self.inst_id)
         try:
-            tempdir = pathlib.Path(td.name)
-            temp_download_file = tempdir.joinpath(f"{self.name}.zip")
-            temp_persist_dir = tempdir.joinpath(self.name)
-            client = self.cmd_helper.get_http_client()
-            await client.download_file(
-                dl_url, content_type, temp_download_file, size,
-                self.cmd_helper.on_download_progress)
-            self.cmd_helper.notify_update_response(
-                f"Download Complete, extracting release to '{self.path}'")
-            await event_loop.run_in_thread(
-                self._extract_release, temp_persist_dir,
-                temp_download_file)
-        finally:
-            await event_loop.run_in_thread(td.cleanup)
-        self.version = self.remote_version
-        await self._validate_client_info()
-        self.cmd_helper.notify_update_response(
-            f"Client Update Finished: {self.name}", is_complete=True)
-        self._log_client_info()
-        self._save_state()
-        return True
+            buf: memoryview = self.shm.buf
+            null_len = min(self.shm.size, max(len(self.inst_id), 10))
+            data = b"\n".join(iids) + b"\x00" if iids else b"\x00" * null_len
+            buf[:len(data)] = data
+            self.shm.close()
+            if not iids:
+                self.shm.unlink()
+        except Exception:
+            logging.exception("Failed to write/close shared memory")
 
-    def _extract_release(self,
-                         persist_dir: pathlib.Path,
-                         release_file: pathlib.Path
-                         ) -> None:
-        if not persist_dir.exists():
-            os.mkdir(persist_dir)
-        if self.path.is_dir():
-            # find and move persistent files
-            for fname in os.listdir(self.path):
-                src_path = self.path.joinpath(fname)
-                if fname in self.persistent_files:
-                    dest_dir = persist_dir.joinpath(fname).parent
-                    os.makedirs(dest_dir, exist_ok=True)
-                    shutil.move(str(src_path), str(dest_dir))
-            shutil.rmtree(self.path)
-        os.mkdir(self.path)
-        with zipfile.ZipFile(release_file) as zf:
-            zf.extractall(self.path)
-        # Move temporary files back into
-        for fname in os.listdir(persist_dir):
-            src_path = persist_dir.joinpath(fname)
-            dest_dir = self.path.joinpath(fname).parent
-            os.makedirs(dest_dir, exist_ok=True)
-            shutil.move(str(src_path), str(dest_dir))
-
-    def get_update_status(self) -> Dict[str, Any]:
-        return {
-            'name': self.name,
-            'owner': self.owner,
-            'version': self.version,
-            'remote_version': self.remote_version,
-            'configured_type': self.type,
-            'channel': self.channel,
-            'info_tags': self.info_tags,
-            'last_error': self.last_error,
-            'is_valid': self._valid,
-            'warnings': self.warnings
-        }
 
 def load_component(config: ConfigHelper) -> UpdateManager:
     return UpdateManager(config)
